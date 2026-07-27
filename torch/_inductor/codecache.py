@@ -1404,6 +1404,65 @@ class FxGraphHashDetails:
                     return True
         return False
 
+    # Op namespaces whose schemas are compiled into the PyTorch binary and are
+    # therefore already captured by torch_key(). Ops outside these namespaces
+    # (i.e. custom ops), or ops in these namespaces that were defined in Python,
+    # can be (re)defined with a different schema in another process while keeping
+    # the same qualified name, so their schema must be hashed explicitly.
+    # See https://github.com/pytorch/pytorch/issues/187319.
+    _BUILTIN_OP_NAMESPACES = OrderedSet(["aten", "prim", "prims"])
+
+    @classmethod
+    def _op_needs_explicit_schema(cls, op: torch._ops.OpOverload) -> bool:
+        return op.namespace not in cls._BUILTIN_OP_NAMESPACES or getattr(
+            op, "_defined_in_python", False
+        )
+
+    @classmethod
+    def _collect_custom_op_schemas(cls, value: Any, schemas: OrderedSet[str]) -> None:
+        """
+        Recursively collect schema strings for custom ops referenced by ``value``
+        (an FX node's target, args, or kwargs).
+
+        The op name recorded in an FX graph (e.g. ``torch.ops.mylib.foo.default``)
+        does not capture the op's schema, so two custom ops registered under the
+        same name but with different schemas (for example differing
+        ``mutates_args`` / alias annotations) would otherwise produce identical
+        graph bytes and share a cache entry, silently reusing a stale graph. An op
+        can appear either as a node's target or nested inside its args/kwargs (for
+        example wrapped by ``auto_functionalized``), so we walk both.
+        """
+        if isinstance(value, torch._ops.OpOverload):
+            if cls._op_needs_explicit_schema(value):
+                schemas.add(str(value._schema))
+        elif isinstance(value, torch._ops.OpOverloadPacket):
+            for overload_name in value.overloads():
+                overload = getattr(value, overload_name)
+                if cls._op_needs_explicit_schema(overload):
+                    schemas.add(str(overload._schema))
+        elif isinstance(value, (list, tuple, OrderedSet, frozenset)):
+            for item in value:
+                cls._collect_custom_op_schemas(item, schemas)
+        elif isinstance(value, dict):
+            for item in itertools.chain(value.keys(), value.values()):
+                cls._collect_custom_op_schemas(item, schemas)
+
+    @classmethod
+    def _custom_op_schemas(cls, gm: torch.fx.GraphModule | None) -> tuple[str, ...]:
+        if gm is None:
+            return ()
+        schemas: OrderedSet[str] = OrderedSet()
+        for module in gm.modules():
+            if not isinstance(module, torch.fx.GraphModule):
+                continue
+            for node in module.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                cls._collect_custom_op_schemas(node.target, schemas)
+                cls._collect_custom_op_schemas(node.args, schemas)
+                cls._collect_custom_op_schemas(node.kwargs, schemas)
+        return tuple(sorted(schemas))
+
     def __init__(
         self,
         gm: torch.fx.GraphModule | None,
@@ -1489,6 +1548,11 @@ class FxGraphHashDetails:
                     self.user_defined_triton_source.append(
                         (kernel_source, constant_args, configs)
                     )
+
+        # Custom-op schemas are not captured by the serialized graph (which only
+        # records op qualified names), so include them explicitly to distinguish
+        # same-named ops whose schema (e.g. mutates_args) differs.
+        self.custom_op_schemas = self._custom_op_schemas(gm)
 
         no_tensor_inputs = not any(isinstance(x, torch.Tensor) for x in example_inputs)
         # This device index is usually already encoded by the device of the inputs
