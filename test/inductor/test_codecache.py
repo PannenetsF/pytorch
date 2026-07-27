@@ -3292,6 +3292,56 @@ class TestFxGraphCacheHashing(TestCase):
         graph.output(result)
         return torch.fx.GraphModule({}, graph)
 
+    def _custom_op_schema_cache_key(self, mutates_out):
+        # Register a custom op under a fixed name whose only difference is
+        # mutates_args, build a graph that calls it, and return the cache key
+        # and rendered schema.
+        with torch.library._scoped_library("test_fx_cache_schema", "FRAGMENT") as lib:
+
+            def mul_out(x: torch.Tensor, y: torch.Tensor, *, out: torch.Tensor) -> None:
+                torch.mul(torch.mul(x, y), x, out=out)
+
+            schema = torch.library.infer_schema(
+                mul_out, mutates_args=["out"] if mutates_out else []
+            )
+            lib.define("mul" + schema)
+            op = torch.ops.test_fx_cache_schema.mul.default
+
+            graph = torch.fx.Graph()
+            x = graph.placeholder("x")
+            y = graph.placeholder("y")
+            out = graph.placeholder("out")
+            graph.call_function(op, (x, y), {"out": out})
+            graph.output(out)
+            gm = torch.fx.GraphModule({}, graph)
+
+            with FakeTensorMode():
+                example_inputs = [torch.empty(4), torch.empty(4), torch.empty(4)]
+            return self._fx_graph_cache_key(gm, example_inputs), str(op._schema)
+
+    def test_custom_op_schema_affects_cache_key(self):
+        # Custom ops registered under the same name but with different schemas
+        # (here, different mutates_args) must not share an FX graph cache key,
+        # otherwise a stale graph is silently reused.
+        # https://github.com/pytorch/pytorch/issues/187319
+        non_mutating_key, non_mutating_schema = self._custom_op_schema_cache_key(
+            mutates_out=False
+        )
+        mutating_key, mutating_schema = self._custom_op_schema_cache_key(
+            mutates_out=True
+        )
+        # Sanity check that the two registrations really differ only in the
+        # mutation annotation of `out`.
+        self.assertEqual(
+            non_mutating_schema,
+            "test_fx_cache_schema::mul(Tensor x, Tensor y, *, Tensor out) -> ()",
+        )
+        self.assertEqual(
+            mutating_schema,
+            "test_fx_cache_schema::mul(Tensor x, Tensor y, *, Tensor(a2!) out) -> ()",
+        )
+        self.assertNotEqual(non_mutating_key, mutating_key)
+
     def test_cpu_thread_count_affects_cache_key(self):
         def fn(x):
             return x + 1
