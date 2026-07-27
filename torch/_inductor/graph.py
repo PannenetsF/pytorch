@@ -1551,6 +1551,13 @@ class GraphLowering(torch.fx.Interpreter):
         """
         True if this is a small constant attr that will be inlined.
         """
+        # A tensor with symbolic sizes/strides is not a genuine (static)
+        # constant and must not be inlined: the inlining path materializes the
+        # value via ``value.tolist()``, which calls ``storage_offset()`` and
+        # fails on symbolic-shaped fake tensors. Fall through to the regular
+        # buffer-materialization path instead.
+        if t._has_symbolic_sizes_strides:
+            return False
         return len(t.shape) == 1 and t.shape[0] <= 8
 
     # pyrefly: ignore [bad-override]

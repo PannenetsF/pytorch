@@ -71,7 +71,11 @@ from torch.compiler._cache import (
     CacheArtifactRecorder,
     CacheInfo,
 )
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.experimental.symbolic_shapes import (
+    DimDynamic,
+    ShapeEnv,
+    StatelessSymbolicContext,
+)
 from torch.testing._internal.common_cuda import (
     SM80OrLater,
     TEST_MULTIGPU,
@@ -3549,6 +3553,16 @@ class TestFxGraphCacheHashing(TestCase):
 
         self.assertTrue(GraphLowering.can_inline_constant(small))
         self.assertFalse(GraphLowering.can_inline_constant(large))
+
+        # A tensor with symbolic sizes/strides must never be inlined, even
+        # if its (hinted) shape is small. Inlining materializes the value
+        # via ``.tolist()``, which calls ``storage_offset()`` and crashes on
+        # symbolic-shaped fake tensors (see issue #187907).
+        fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+        sym_ctx = StatelessSymbolicContext(dynamic_sizes=[DimDynamic.DYNAMIC])
+        sym_small = fake_mode.from_tensor(torch.rand(8), symbolic_context=sym_ctx)
+        self.assertTrue(sym_small._has_symbolic_sizes_strides)
+        self.assertFalse(GraphLowering.can_inline_constant(sym_small))
 
         # By default, we hash the metadata and values independent of the size.
         gm = torch.fx.GraphModule({}, torch.fx.Graph())
