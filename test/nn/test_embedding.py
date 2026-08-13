@@ -986,6 +986,29 @@ class TestEmbeddingNNDeviceType(NNTestCase):
 
         torch.testing.assert_close(torch.ones(dim, device=device), grad_at_r(dtype))
 
+    # https://github.com/pytorch/pytorch/issues/193095
+    @onlyOn(["cuda"])
+    @unittest.skipIf(TEST_WITH_ROCM, "test requires CUDA device-side assertions")
+    @parametrize_test(
+        "mode,offsets",
+        (("sum", [-10**12] * 5), ("max", [0, 6, 6, 6, 6])),
+    )
+    def test_embedding_bag_invalid_offsets_cuda(self, device, mode, offsets):
+        stderr = self.runWithPytorchAPIUsageStderr(
+            f"""\
+import torch
+import torch.nn.functional as F
+
+weight = torch.zeros((10, 5), device={device!r})
+indices = torch.zeros((5,), dtype=torch.int64, device={device!r})
+offsets = torch.tensor({offsets!r}, dtype=torch.int64, device={device!r})
+F.embedding_bag(indices, weight, offsets, mode={mode!r})
+torch.cuda.synchronize()
+"""
+        )
+        self.assertIn("Invalid offsets in EmbeddingBag", stderr)
+        self.assertNotIn("illegal memory access", stderr)
+
     # https://github.com/pytorch/pytorch/issues/190063
     @onlyNativeDeviceTypes
     @dtypes(torch.float32, torch.float64)
